@@ -1,0 +1,793 @@
+
+
+# 📘 Часть 7: Закрепление + мини-проект с `localStorage`
+
+## 7.1 Зачем `localStorage` в React
+
+`localStorage` — это встроенное в браузер хранилище «ключ-значение»:
+- Данные сохраняются **после закрытия браузера** (в отличие от `sessionStorage`)
+- Хранит **только строки** (объекты нужно сериализовать через `JSON.stringify`)
+- Лимит ~5–10 МБ
+- Синхронный (блокирует main thread — не храни там мегабайты)
+- Привязан к **домену** (данные `localhost:5173` не видны на `localhost:3000`)
+
+**Типичные кейсы в React:** черновики форм, настройки темы, todo-листы, «недавно просмотренные».
+
+### Базовые операции
+
+```js
+// Запись (только строки!)
+localStorage.setItem('theme', 'dark');
+
+// Чтение (вернёт null, если ключа нет)
+const theme = localStorage.getItem('theme'); // 'dark'
+
+// Удаление одного ключа
+localStorage.removeItem('theme');
+
+// Полная очистка (осторожно — снесёт ВСЁ для домена)
+localStorage.clear();
+```
+
+### Сериализация объектов
+
+```js
+const user = { name: 'Иван', age: 25 };
+
+// ❌ Так сохранится "[object Object]" — бесполезно
+localStorage.setItem('user', user);
+
+// ✅ Сначала в JSON-строку
+localStorage.setItem('user', JSON.stringify(user));
+
+// ✅ При чтении — обратно в объект
+const saved = JSON.parse(localStorage.getItem('user'));
+```
+
+**Всегда оборачивай `JSON.parse` в `try/catch`:** в хранилище может лежать битая строка (пользователь руками залез, предыдущая версия приложения писала другой формат).
+
+---
+
+## 7.2 Паттерн «ленивая инициализация + эффект сохранения»
+
+Это **канонический** способ связать состояние React с `localStorage`.
+
+### ❌ Как делать не надо
+
+```jsx
+const [todos, setTodos] = useState([]);
+
+// Эффект загрузки
+useEffect(() => {
+  const saved = localStorage.getItem('todos');
+  if (saved) setTodos(JSON.parse(saved));
+}, []);
+
+// Эффект сохранения
+useEffect(() => {
+  localStorage.setItem('todos', JSON.stringify(todos));
+}, [todos]);
+```
+
+**Проблема:** при первом рендере `todos` — пустой массив. Эффект сохранения срабатывает **сразу** и перезаписывает `localStorage` пустым массивом **до того**, как эффект загрузки успеет прочитать старые данные. Данные теряются.
+
+### ✅ Правильно: ленивая инициализация
+
+```jsx
+const [todos, setTodos] = useState(() => {
+  // Эта функция вызывается ТОЛЬКО при первом рендере
+  try {
+    const saved = localStorage.getItem('todos');
+    return saved ? JSON.parse(saved) : [];
+  } catch {
+    return []; // если данные битые — fallback
+  }
+});
+
+// Сохраняем при каждом изменении
+useEffect(() => {
+  localStorage.setItem('todos', JSON.stringify(todos));
+}, [todos]);
+```
+
+**Почему работает:**
+1. `useState(() => ...)` — функция вызывается **один раз** при монтировании, до первого рендера
+2. `todos` сразу инициализируется данными из `localStorage`
+3. Эффект сохранения срабатывает уже с правильными данными
+
+Этот паттерн ты будешь использовать постоянно. Запомни его.
+
+---
+
+## 7.3 Кастомный хук `useLocalStorage`
+
+Чтобы не дублировать логику, вынесем её в переиспользуемый хук.
+
+### `src/hooks/useLocalStorage.js`
+
+```jsx
+import { useEffect, useState } from 'react';
+
+/**
+ * Синхронизирует состояние React с localStorage.
+ *
+ * @param {string} key — ключ в localStorage
+ * @param {any} initialValue — значение по умолчанию (если в хранилище пусто)
+ * @returns {[any, Function]} — [значение, сеттер] (как у useState)
+ */
+export function useLocalStorage(key, initialValue) {
+  // Ленивая инициализация: читаем из хранилища только при монтировании
+  const [value, setValue] = useState(() => {
+    try {
+      const saved = localStorage.getItem(key);
+      // Если ключа нет — используем initialValue.
+      // Если initialValue — функция, вызываем её (как в useState).
+      if (saved !== null) {
+        return JSON.parse(saved);
+      }
+      return typeof initialValue === 'function' ? initialValue() : initialValue;
+    } catch (error) {
+      // Битый JSON, запрещённый localStorage (приватный режим) и т.п.
+      console.warn(`useLocalStorage: не удалось прочитать "${key}"`, error);
+      return typeof initialValue === 'function' ? initialValue() : initialValue;
+    }
+  });
+
+  // Сохраняем при каждом изменении значения
+  useEffect(() => {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch (error) {
+      // QuotaExceededError или приватный режим
+      console.warn(`useLocalStorage: не удалось сохранить "${key}"`, error);
+    }
+  }, [key, value]);
+
+  return [value, setValue];
+}
+```
+
+**Что здесь важно:**
+- `try/catch` и на чтении, и на записи — приложение не падает, если `localStorage` недоступен
+- `initialValue` может быть функцией (как в `useState`) — для дорогих вычислений
+- Зависимости `[key, value]` — если ключ изменится, сохраним в новый
+
+---
+
+## 7.4 🎯 Мини-проект: Todo с `localStorage`
+
+Соберём todo, который **переживает перезагрузку страницы** — это требование из твоего плана на День 7.
+
+### `src/hooks/useLocalStorage.js`
+
+(см. выше — создай этот файл)
+
+### `src/components/TodoForm.jsx`
+
+```jsx
+import { useState } from 'react';
+
+function TodoForm({ onAdd }) {
+  const [text, setText] = useState('');
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    const trimmed = text.trim();
+    if (!trimmed) return;
+
+    onAdd(trimmed);
+    setText(''); // очищаем поле после добавления
+  }
+
+  return (
+    <form onSubmit={handleSubmit} style={{ display: 'flex', gap: 8 }}>
+      <input
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Новая задача..."
+        style={{ flex: 1, padding: 10 }}
+      />
+      <button type="submit" style={{ padding: '10px 20px' }}>
+        Добавить
+      </button>
+    </form>
+  );
+}
+
+export default TodoForm;
+```
+
+### `src/components/TodoItem.jsx`
+
+```jsx
+function TodoItem({ todo, onToggle, onDelete }) {
+  return (
+    <li
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        padding: '10px 0',
+        borderBottom: '1px solid #eee',
+      }}
+    >
+      <input
+        type="checkbox"
+        checked={todo.done}
+        onChange={() => onToggle(todo.id)}
+      />
+      <span
+        style={{
+          flex: 1,
+          textDecoration: todo.done ? 'line-through' : 'none',
+          color: todo.done ? '#999' : '#1e293b',
+        }}
+      >
+        {todo.text}
+      </span>
+      <button
+        onClick={() => onDelete(todo.id)}
+        style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer' }}
+      >
+        ✕
+      </button>
+    </li>
+  );
+}
+
+export default TodoItem;
+```
+
+### `src/App.jsx`
+
+```jsx
+import { useLocalStorage } from './hooks/useLocalStorage';
+import TodoForm from './components/TodoForm';
+import TodoItem from './components/TodoItem';
+
+const STORAGE_KEY = 'todos-v1';
+
+function App() {
+  // 🔑 Главное: состояние живёт в localStorage автоматически
+  const [todos, setTodos] = useLocalStorage(STORAGE_KEY, []);
+
+  function addTodo(text) {
+    const newTodo = {
+      id: crypto.randomUUID(), // современный способ уникального id
+      text,
+      done: false,
+    };
+    setTodos((prev) => [...prev, newTodo]);
+  }
+
+  function toggleTodo(id) {
+    setTodos((prev) =>
+      prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t))
+    );
+  }
+
+  function deleteTodo(id) {
+    setTodos((prev) => prev.filter((t) => t.id !== id));
+  }
+
+  function clearAll() {
+    if (confirm('Удалить все задачи?')) {
+      setTodos([]); // хук сам очистит localStorage
+    }
+  }
+
+  const doneCount = todos.filter((t) => t.done).length;
+
+  return (
+    <div style={{ maxWidth: 500, margin: '40px auto', padding: 20 }}>
+      <h1>📝 Todo (сохраняется)</h1>
+
+      <TodoForm onAdd={addTodo} />
+
+      <p style={{ color: '#666', fontSize: 14 }}>
+        Всего: {todos.length} | Выполнено: {doneCount}
+      </p>
+
+      {todos.length === 0 ? (
+        <p style={{ textAlign: 'center', color: '#999', padding: 40 }}>
+          Задач пока нет. Добавь первую — она переживёт перезагрузку!
+        </p>
+      ) : (
+        <>
+          <ul style={{ listStyle: 'none', padding: 0 }}>
+            {todos.map((todo) => (
+              <TodoItem
+                key={todo.id}
+                todo={todo}
+                onToggle={toggleTodo}
+                onDelete={deleteTodo}
+              />
+            ))}
+          </ul>
+          <button onClick={clearAll} style={{ marginTop: 16, color: '#ef4444' }}>
+            Очистить всё
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+export default App;
+```
+
+**Проверь:**
+1. Добавь 2–3 задачи
+2. Перезагрузи страницу (F5) — задачи на месте
+3. Отметь выполненные, перезагрузи — статус сохранился
+4. Открой DevTools → Application → Local Storage → увидишь JSON
+
+**✅ Чек-лист части 7:**
+- [ ] Понимаю, что `localStorage` хранит только строки
+- [ ] Умею сериализовать/десериализовать через `JSON.stringify` / `JSON.parse`
+- [ ] Использую ленивую инициализацию `useState(() => ...)` для чтения
+- [ ] Сохраняю через `useEffect` с зависимостью от значения
+- [ ] Оборачиваю чтение в `try/catch` — приложение не падает на битых данных
+- [ ] Написал кастомный хук `useLocalStorage` и использую его
+
+---
+
+# 📘 Часть 8: Роутинг (React Router)
+
+## 8.1 Зачем нужен роутинг в SPA
+
+В классическом сайте каждая страница — отдельный HTML-файл. Переход = запрос к серверу.
+
+В **SPA (Single Page Application)** у тебя **один** `index.html`. React меняет содержимое на лету. Но пользователю всё равно нужны **разные URL**: чтобы работали закладки, кнопка «Назад», шаринг ссылок.
+
+**React Router** связывает **URL** с **компонентами**:
+- `/` → `<Home />`
+- `/about` → `<About />`
+- `/users/42` → `<UserProfile userId={42} />`
+
+При этом страница **не перезагружается**.
+
+---
+
+## 8.2 Установка и базовая настройка
+
+```bash
+npm install react-router-dom
+```
+
+### Точка входа `main.jsx`
+
+```jsx
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import App from './App';
+import './index.css';
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    {/* BrowserRouter оборачивает ВСЁ приложение — даёт доступ к роутингу */}
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </React.StrictMode>
+);
+```
+
+**`BrowserRouter`** использует HTML5 History API. Альтернативы: `HashRouter` (для GitHub Pages без настройки), `MemoryRouter` (для тестов).
+
+### `App.jsx` — определяем маршруты
+
+```jsx
+import { Routes, Route } from 'react-router-dom';
+import Home from './pages/Home';
+import About from './pages/About';
+import NotFound from './pages/NotFound';
+
+function App() {
+  return (
+    <Routes>
+      {/* path — URL, element — что рендерить */}
+      <Route path="/" element={<Home />} />
+      <Route path="/about" element={<About />} />
+
+      {/* * — «всё остальное» → 404 */}
+      <Route path="*" element={<NotFound />} />
+    </Routes>
+  );
+}
+
+export default App;
+```
+
+**Важно:** в React Router v6 используется `element={<Component />}`, а не `component={Component}` (это было в v5).
+
+---
+
+## 8.3 Навигация: `Link` и `NavLink`
+
+### `Link` — замена `<a>`
+
+```jsx
+import { Link } from 'react-router-dom';
+
+<Link to="/about">О нас</Link>
+```
+
+**Почему не `<a href>`:** `<a>` вызывает **полную перезагрузку страницы**, теряя состояние React. `Link` перехватывает клик и меняет URL через History API — без перезагрузки.
+
+### `NavLink` — с активным состоянием
+
+```jsx
+import { NavLink } from 'react-router-dom';
+
+<NavLink
+  to="/about"
+  className={({ isActive }) => (isActive ? 'nav-active' : '')}
+>
+  О нас
+</NavLink>
+```
+
+`NavLink` автоматически знает, совпадает ли текущий URL с `to`. `isActive` — `true`, если да.
+
+### `useNavigate` — программный переход
+
+```jsx
+import { useNavigate } from 'react-router-dom';
+
+function LoginPage() {
+  const navigate = useNavigate();
+
+  async function handleLogin() {
+    await login();
+    navigate('/dashboard'); // переходим после успешного входа
+  }
+
+  return <button onClick={handleLogin}>Войти</button>;
+}
+```
+
+**Когда нужен `useNavigate`:**
+- После сабмита формы (нельзя сделать через `Link`)
+- После таймера / асинхронной операции
+- Кнопка «Назад»: `navigate(-1)`
+
+⚠️ **Никогда не вызывай `navigate` во время рендера** — только в обработчиках или эффектах.
+
+---
+
+## 8.4 Динамические маршруты и `useParams`
+
+### Определение
+
+```jsx
+<Route path="/users/:userId" element={<UserProfile />} />
+```
+
+`:userId` — **параметр**. Он матчит `/users/1`, `/users/42`, `/users/abc`.
+
+### Получение параметра
+
+```jsx
+import { useParams } from 'react-router-dom';
+
+function UserProfile() {
+  const { userId } = useParams(); // строка!
+
+  return <h1>Профиль пользователя #{userId}</h1>;
+}
+```
+
+**Важно:** `useParams` возвращает **строки**. Если нужен `number` — конвертируй: `Number(userId)`.
+
+### Несколько параметров
+
+```jsx
+<Route path="/users/:userId/posts/:postId" element={<Post />} />
+
+// В компоненте:
+const { userId, postId } = useParams();
+```
+
+---
+
+## 8.5 Вложенные маршруты и `Outlet`
+
+### Проблема: общий layout
+
+На всех страницах есть шапка и меню. Дублировать их в каждом компоненте — плохо.
+
+### Решение: layout-route + `Outlet`
+
+```jsx
+// App.jsx
+import { Routes, Route, Outlet, NavLink } from 'react-router-dom';
+
+// Layout — общая обёртка. Outlet — «дырка», куда рендерится дочерний маршрут.
+function Layout() {
+  return (
+    <div>
+      <nav style={{ display: 'flex', gap: 16, padding: 16, borderBottom: '1px solid #ddd' }}>
+        <NavLink to="/">Главная</NavLink>
+        <NavLink to="/about">О нас</NavLink>
+        <NavLink to="/users">Пользователи</NavLink>
+      </nav>
+
+      <main style={{ padding: 20 }}>
+        {/* Сюда React Router подставит совпавший дочерний маршрут */}
+        <Outlet />
+      </main>
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <Routes>
+      {/* Layout — родитель для всех страниц */}
+      <Route element={<Layout />}>
+        <Route path="/" element={<Home />} />
+        <Route path="/about" element={<About />} />
+        <Route path="/users" element={<UsersList />} />
+        <Route path="/users/:userId" element={<UserProfile />} />
+      </Route>
+    </Routes>
+  );
+}
+```
+
+**Как это работает:** `<Route element={<Layout />}>` без `path` — это **layout route**. Он не добавляет сегмент к URL, но оборачивает всех детей. `<Outlet />` внутри `Layout` — место, где рендерится совпавший дочерний маршрут.
+
+---
+
+## 8.6 🎯 Практика Части 8: Многостраничное приложение
+
+Сделаем мини-приложение с навигацией: главная, список пользователей, профиль пользователя (динамический), 404.
+
+### Структура
+
+```
+src/
+├── pages/
+│   ├── Home.jsx
+│   ├── About.jsx
+│   ├── UsersList.jsx
+│   ├── UserProfile.jsx
+│   └── NotFound.jsx
+├── App.jsx
+└── main.jsx
+```
+
+### `src/pages/Home.jsx`
+
+```jsx
+import { Link } from 'react-router-dom';
+
+function Home() {
+  return (
+    <div>
+      <h1>Главная</h1>
+      <p>Добро пожаловать! Это демо роутинга.</p>
+      <Link to="/users">Перейти к пользователям →</Link>
+    </div>
+  );
+}
+
+export default Home;
+```
+
+### `src/pages/UsersList.jsx`
+
+```jsx
+import { Link } from 'react-router-dom';
+
+// «База данных» — в реальном приложении пришла бы с API
+const users = [
+  { id: 1, name: 'Анна' },
+  { id: 2, name: 'Пётр' },
+  { id: 3, name: 'Мария' },
+];
+
+function UsersList() {
+  return (
+    <div>
+      <h1>Пользователи</h1>
+      <ul>
+        {users.map((user) => (
+          <li key={user.id}>
+            {/* Ссылка на динамический маршрут */}
+            <Link to={`/users/${user.id}`}>{user.name}</Link>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export default UsersList;
+```
+
+### `src/pages/UserProfile.jsx`
+
+```jsx
+import { Link, useParams, useNavigate } from 'react-router-dom';
+
+const users = {
+  1: { name: 'Анна', email: 'anna@mail.ru', city: 'Москва' },
+  2: { name: 'Пётр', email: 'petr@mail.ru', city: 'СПб' },
+  3: { name: 'Мария', email: 'maria@mail.ru', city: 'Казань' },
+};
+
+function UserProfile() {
+  const { userId } = useParams(); // строка из URL
+  const navigate = useNavigate();
+  const user = users[userId];
+
+  // Обработка несуществующего id
+  if (!user) {
+    return (
+      <div>
+        <h1>Пользователь не найден</h1>
+        <p>ID: {userId}</p>
+        <button onClick={() => navigate('/users')}>К списку</button>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <h1>{user.name}</h1>
+      <p>Email: {user.email}</p>
+      <p>Город: {user.city}</p>
+
+      {/* Кнопка «Назад» — navigate(-1) как кнопка браузера */}
+      <button onClick={() => navigate(-1)}>← Назад</button>
+      {' '}
+      <Link to="/users">Все пользователи</Link>
+    </div>
+  );
+}
+
+export default UserProfile;
+```
+
+### `src/pages/NotFound.jsx`
+
+```jsx
+import { Link } from 'react-router-dom';
+
+function NotFound() {
+  return (
+    <div style={{ textAlign: 'center', padding: 40 }}>
+      <h1>404</h1>
+      <p>Страница не найдена</p>
+      <Link to="/">На главную</Link>
+    </div>
+  );
+}
+
+export default NotFound;
+```
+
+### `src/App.jsx`
+
+```jsx
+import { Routes, Route, NavLink, Outlet } from 'react-router-dom';
+import Home from './pages/Home';
+import About from './pages/About';
+import UsersList from './pages/UsersList';
+import UserProfile from './pages/UserProfile';
+import NotFound from './pages/NotFound';
+
+function Layout() {
+  // Стиль для NavLink — функция от isActive
+  const linkStyle = ({ isActive }) => ({
+    fontWeight: isActive ? 'bold' : 'normal',
+    color: isActive ? '#3b82f6' : '#374151',
+    textDecoration: 'none',
+    padding: '8px 12px',
+  });
+
+  return (
+    <div>
+      <nav style={{ display: 'flex', gap: 4, padding: 12, borderBottom: '1px solid #ddd' }}>
+        <NavLink to="/" style={linkStyle}>Главная</NavLink>
+        <NavLink to="/about" style={linkStyle}>О нас</NavLink>
+        <NavLink to="/users" style={linkStyle}>Пользователи</NavLink>
+      </nav>
+
+      <main style={{ maxWidth: 700, margin: '0 auto', padding: 20 }}>
+        <Outlet />
+      </main>
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <Routes>
+      <Route element={<Layout />}>
+        <Route path="/" element={<Home />} />
+        <Route path="/about" element={<About />} />
+        <Route path="/users" element={<UsersList />} />
+        <Route path="/users/:userId" element={<UserProfile />} />
+        <Route path="*" element={<NotFound />} />
+      </Route>
+    </Routes>
+  );
+}
+
+export default App;
+```
+
+### `src/main.jsx`
+
+```jsx
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import App from './App';
+import './index.css';
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </React.StrictMode>
+);
+```
+
+**Проверь:**
+1. Открой `/` — главная с layout
+2. Кликни «Пользователи» — URL меняется на `/users`, страница не перезагружается
+3. Кликни «Анна» — URL `/users/1`, профиль показывает её данные
+4. Введи `/users/999` — профиль «не найден»
+5. Введи `/random` — 404
+6. Кнопка «Назад» в браузере работает
+
+**✅ Чек-лист Части 8:**
+- [ ] Понимаю, зачем `BrowserRouter` и куда его ставить
+- [ ] Умею определять маршруты через `<Routes>` и `<Route>`
+- [ ] Использую `Link` вместо `<a>` для навигации
+- [ ] Знаю, чем `NavLink` отличается от `Link` (активное состояние)
+- [ ] Умею делать программный переход через `useNavigate`
+- [ ] Использую `:param` в path и `useParams` для получения
+- [ ] Понимаю layout-route и `<Outlet />`
+- [ ] Обрабатываю `*` для 404
+
+---
+
+## 🏋️ Упражнения для закрепления
+
+### Часть 7
+1. **Счётчик с сохранением**: `useState` + `useLocalStorage` — счётчик не сбрасывается после перезагрузки.
+2. **Тема с сохранением**: кнопка light/dark, тема сохраняется, при загрузке применяется сразу (без «мигания»).
+3. **Черновик заметки**: textarea, текст автосохраняется в `localStorage` каждые 500 мс (через debounce в `useEffect`).
+4. **Очистка с подтверждением**: кнопка «Сбросить всё» с `confirm`.
+
+### Часть 8
+5. **Блог**: маршруты `/`, `/posts`, `/posts/:id`, `/about`. Данные постов — массив в памяти.
+6. **Хлебные крошки**: на странице `/users/:id` показывай «Главная / Пользователи / Анна» — используй `useParams` и `Link`.
+7. **Защищённый маршрут**: `/admin` доступен только если `isAdmin === true` (захардкодь переменную). Иначе — редирект на `/` через `<Navigate>`.
+8. **Query-параметры**: на `/users` добавь фильтр `?city=Москва`. Используй `useSearchParams`.
+
+---
+
+## 📋 Чек-лист самопроверки (итог Части 7–8)
+
+**Часть 7:**
+- [ ] `localStorage` хранит только строки — всегда `JSON.stringify`
+- [ ] Читаю через ленивую инициализацию `useState(() => ...)`
+- [ ] Сохраняю через `useEffect` с зависимостью
+- [ ] Оборачиваю парсинг в `try/catch`
+- [ ] Могу написать кастомный `useLocalStorage` с нуля
+
+**Часть 8:**
+- [ ] `BrowserRouter` оборачивает приложение в `main.jsx`
+- [ ] `Routes` + `Route` определяют соответствие URL → компонент
+- [ ] `Link` / `NavLink` — для навигации, `useNavigate` — для программной
+- [ ] `:param` + `useParams` — для динамических URL
+- [ ] Layout-route + `<Outlet />` — для общих частей
+- [ ] `*` — для 404
